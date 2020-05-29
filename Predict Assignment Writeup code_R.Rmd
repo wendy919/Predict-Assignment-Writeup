@@ -1,0 +1,260 @@
+---
+title: ' Advanced Predict Assignment Writeup'
+subtitle: Wendi YANG_67609_EDHEC Business School
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+<!-- This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.  -->
+
+<!-- Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*.  -->
+
+# 1.Overview
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.
+
+The objective of this report is to demonstrate the process employed to arrive at a prediction algorithm, which aims to classify the manner in which the participants employed certain exercises. The data comes from accelerometers attached on the belt, forearm and dumbells.
+
+# 2.Introduction
+The goal of Predict Assignment Writeup is to predict the manner in which 6 participants did a weight lifting exercise. For this, I downloaded a training dataset and a test dataset and then created a model, used cross validation, calculated an expected out of sample error. In this write-up, I would also describe how I built the model, and why I made the choices that I did. I also used the model to predict the 20 test cases.
+
+# 3.Dataset Overview
+## 3.1 Dataset Loading
+From the URL provided from the Coursera, I download from the link and then get the original training dataset and test dataset. 
+
+```{r}
+#Environment uploading R libraries
+# install.packages(c("lattice","ggplot2","dplyr","randomForest","gridExtra","rattle","tibble","bitops"))
+library(ggplot2)
+library(rattle)
+library(dplyr)
+library(randomForest)
+library(corrplot)
+library(rpart)
+library(rpart.plot)
+library(knitr)
+library(caret)
+library(corrplot)
+library(lattice)
+library(gridExtra)
+library(grid)
+
+#data loading
+urltrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+urltest <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+training <- read.csv(url(urltrain), na.strings = c("NA","#DIV/0!",""))
+testing <- read.csv(url(urltest), na.strings = c("NA","#DIV/0!",""))
+
+dim(training)
+dim(testing)
+```
+```{r}
+head(training)
+```
+
+The dataset consists 160 variables in all, excluding the outcome variable "Classe", there are 159 candidates to be included as predictors. However, a close examination of the data would indicate that some variables might not be usefull in this model. As we can see, some variables have plenty of missing values NA. 
+```{r}
+head(sapply(training, function(x) sum(is.na(x))), n=30)
+```
+
+## 3.2 Exploratory Analysis
+As there are many dummy variables in these data, several columns do not measurements for each observations, but are rather summary statistics for one sliding window. In the validation data which we would like to predict are just random draws of one observation at a particular time point. In this case, it's easy to omit many of the summary variables in the dataset as they are not usefull for particular prediction problem, and also seem to be mislabeled in some cases, such as the summary statistics in the wrong columns. The inappropriate structure of the variables is borne out by the near zero variances.
+
+```{r}
+qplot1 <- qplot(classe, cvtd_timestamp, data = training, color=user_name,size=I(6))
+qplot2 <-qplot(classe, num_window, data = training, color=user_name, size=I(4))
+grid.arrange(qplot1, qplot2,ncol=2)
+```
+From the exploratory plots, the participants in this case all performed these trials in temporal order. They all started doing biceps curls the proper way in Class A, then proceeded with Class B then C etc. The relation is an artifact of the case design which would allow to predict the validation data with great accuracy, but may fall if I try to accurately predict new data given only accelerometer measurements. Therefor, I would exclude all of the near zero variables and ID variables, as it is based solely onb accelerometer measurements.
+
+## 3.3 Data splitting
+The original training dataset is partinioned in 2 to create a training set, which is 80% of the data as suggested by course for modeling process and a test set with the remaining 20% for validations. The test dataset keep as original and is only used for evaluate the final generation test.
+```{r}
+#create a partition with the training set
+set.seed(12345)
+inTrain <- createDataPartition(training$classe, p=0.8, list=FALSE)
+trainset <- training[inTrain,]
+testset <- training[-inTrain,]
+dim(trainset)
+dim(testset)
+```
+
+## 3.4 Data cleaning
+As resulted, the trainset and testset both have 160 variables, and to prevent the varibles contain NA values, then I remove all NA and Near Zero variance variables and ID varibles with cleaning procedures as below. 
+```{r}
+#remove NA variables
+na <- sapply(trainset, function(x) mean(is.na(x))) > 0.95
+trainset <- trainset[, na==FALSE]
+testset <- testset[, na==FALSE]
+#remove near zero variance variables
+nearzerovar <- nearZeroVar(trainset)
+trainset <- trainset[,-nearzerovar]
+testset <- testset[,-nearzerovar]
+#remove columns 1 to 7 identification only variables
+trainset <- trainset[,-(1:7)]
+testset <- testset[,-(1:7)]
+dim(trainset)
+dim(testset)
+```
+After clearning process, there remain 52 variables.
+
+```{r}
+#plot the classe
+plot(training$classe, col="green", main="Classe parametor bar plot", xlab="classe variable", ylab="frequency")
+```
+```{r}
+#description of trainset
+head(trainset)
+```
+
+
+## 3.5 Correlation Analysis
+Before proceeding the model procedures, we use the correlation analysis to see the correlation among variables analyzed.
+```{r}
+cormatrix <- cor(trainset[,-52])
+corrplot(cormatrix, order="FPC", method="color", type="lower", tl.cex = 0.4, tl.col= rgb(0,0,0))
+```
+The dark colors in the graph above are highly correlated variables. To make a more compact analysis, below I would also do a Principla Components Analysis to perform as pre-processing step to the datasets. 
+
+## 3.6 Principal Components Analysis(PCA)
+As there are 52 candidate predictor for the model, it makes sense to employ a dimension reduction technique to manage this large number of predictors. PCA is used on the training set to determine key components among the predictors.
+```{r}
+## Importance of components:
+##                           PC1    PC2     PC3     PC4     PC5     PC6
+## Standard deviation     2.8908 2.8404 2.15722 2.06310 1.91698 1.73606
+## Proportion of Variance 0.1607 0.1552 0.08949 0.08185 0.07067 0.05796
+## Cumulative Proportion  0.1607 0.3159 0.40535 0.48721 0.55788 0.61584
+##                           PC7     PC8     PC9    PC10    PC11    PC12
+## Standard deviation     1.4970 1.44260 1.31145 1.22700 1.18091 1.05869
+## Proportion of Variance 0.0431 0.04002 0.03308 0.02895 0.02682 0.02155
+## Cumulative Proportion  0.6589 0.69895 0.73203 0.76098 0.78780 0.80935
+##                           PC13    PC14    PC15    PC16    PC17    PC18
+## Standard deviation     0.99735 0.93894 0.90818 0.88628 0.82585 0.76246
+## Proportion of Variance 0.01913 0.01695 0.01586 0.01511 0.01312 0.01118
+## Cumulative Proportion  0.82848 0.84544 0.86130 0.87640 0.88952 0.90070
+##                           PC19    PC20    PC21    PC22    PC23    PC24
+## Standard deviation     0.72281 0.69490 0.64577 0.63079 0.61252 0.58068
+## Proportion of Variance 0.01005 0.00929 0.00802 0.00765 0.00722 0.00648
+## Cumulative Proportion  0.91075 0.92003 0.92805 0.93570 0.94292 0.94940
+##                           PC25    PC26    PC27   PC28    PC29    PC30
+## Standard deviation     0.55190 0.54020 0.50381 0.4838 0.44827 0.42168
+## Proportion of Variance 0.00586 0.00561 0.00488 0.0045 0.00386 0.00342
+## Cumulative Proportion  0.95526 0.96087 0.96575 0.9703 0.97412 0.97754
+##                           PC31    PC32    PC33    PC34    PC35    PC36
+## Standard deviation     0.39737 0.36458 0.34743 0.33281 0.30361 0.28094
+## Proportion of Variance 0.00304 0.00256 0.00232 0.00213 0.00177 0.00152
+## Cumulative Proportion  0.98058 0.98313 0.98545 0.98758 0.98936 0.99087
+##                           PC37    PC38    PC39    PC40    PC41    PC42
+## Standard deviation     0.25247 0.23698 0.23329 0.19946 0.19353 0.18415
+## Proportion of Variance 0.00123 0.00108 0.00105 0.00077 0.00072 0.00065
+## Cumulative Proportion  0.99210 0.99318 0.99423 0.99499 0.99571 0.99636
+##                           PC43    PC44    PC45    PC46    PC47    PC48
+## Standard deviation     0.17967 0.17258 0.16761 0.16217 0.14641 0.14235
+## Proportion of Variance 0.00062 0.00057 0.00054 0.00051 0.00041 0.00039
+## Cumulative Proportion  0.99699 0.99756 0.99810 0.99860 0.99902 0.99941
+##                           PC49   PC50    PC51    PC52
+## Standard deviation     0.11222 0.1012 0.07688 0.04626
+## Proportion of Variance 0.00024 0.0002 0.00011 0.00004
+## Cumulative Proportion  0.99965 0.9999 0.99996 1.00000
+```
+
+# 4.Prediction Model Building
+Four methods are applied to model the regression in the train dataset and the best one, which has highest accuracy when applied to the test dataset , would be used for the final predictions. The method used are: Decision Trees, Random Forests, Bagging and Boosting. And I also apply a matrix to present the accuracy below each model in order to select best model by comparing, described as following.
+
+## 4.1 Decision Trees Method
+In fact, it isn't expected the accuracy to be high under decision tree model, because anything around 80% would be acceptable.
+```{r}
+#modelling fit
+set.seed(12345)
+ModfitDectree <- rpart(classe ~ ., data = trainset, method="class")
+fancyRpartPlot(ModfitDectree)
+
+#prediction on testset
+predictDectree <- predict(ModfitDectree, newdata=testset, type="class" )
+confmatDectree <- confusionMatrix(predictDectree, testset$classe)
+confmatDectree
+
+#plot matrix result
+plot(confmatDectree$table, col=confmatDectree$byclass, main=paste("Decision Tree_Accuracy =", round(confmatDectree$overall['Accuracy'], 4)))
+
+```
+
+## 4.2 Random Forest Method
+```{r}
+#modeling fit
+controlRf <- trainControl(method = "cv", number=10, verboseIter = FALSE)
+ModfitRandforest <- train(classe ~ ., data = trainset, method="rf", trControl=controlRf)
+ModfitRandforest$finalModel
+
+#plot
+ModFitRF <- randomForest(classe ~ ., data = trainset, method = "rf", importance = T, trControl = trainControl(method = "cv", classProbs=TRUE,savePredictions=TRUE,allowParallel=TRUE, number = 10))
+ModFitRF
+
+#predition on testset
+predictRanforest <- predict(ModfitRandforest, newdata=testset)
+confmatRanforest <- confusionMatrix(predictRanforest, testset$classe)
+confmatRanforest
+
+#plot matrix result
+plot(confmatRanforest$table, col=confmatRanforest$byClass, main = paste("Random Forest_Accuracy =", round(confmatRanforest$overall['Accuracy'], 4)))
+```
+
+## 4.3 Bagging/Broost Aggreating Method
+```{r}
+#modeling fit
+set.seed(12345)
+controlbag <- trainControl(method="repeatedcv", number=10, repeats= 2)
+modfitBag <- train(classe ~., data = trainset, method="gbm", trControl = controlbag, verbose=FALSE)
+modfitBag$finalModel
+
+#prediction on testset
+predictBag <- predict(modfitBag, newdata=testset)
+confmatBag <- confusionMatrix(predictBag, testset$classe)
+confmatBag
+
+#plot matrix results
+plot(confmatBag$table, col=confmatBag$byclass, main = paste("Bagging_Accuracy = ", round(confmatBag$overall['Accuracy'],4)))
+```
+
+## 4.4 Boosting Method
+```{r}
+#modelling fit
+modfitBoost <- train(classe ~., method="gbm", data = trainset, verbose=FALSE, trControl=trainControl(method="cv", number=10))
+modfitBoost
+plot(modfitBoost) #plot the modelling fit
+
+#prediction on testset
+predictBoost <- predict(modfitBoost, testset)
+confmatBoost <- confusionMatrix(predictBoost, testset$classe)
+confmatBoost
+
+#plot matrix results
+plot(confmatBoost$table, col=confmatBoost$byclass, main=paste("Boosting_Accuracy =", round(confmatBoost$overall['Accuracy'], 4)))
+```
+
+## 4.5 Best Model to Select
+The accuracy of the 4 regression methods above are:
+- Decision Tree: 0.6933
+- Random Forest: 0.9949
+- Bagging: 0.9610
+- Boosting: 0.9625
+
+In this case, the Random Forest model has the highest accuracy compared to other models, so I applied it to predict the 20 testing dataset as shown below:
+```{r}
+predictTest <- predict(ModfitRandforest, newdata=testing)
+predictTest
+```
+
+# 5.Discussion in Financial Application
+## 5.1 
+
+Decision Trees for real option analysis;
+Pricing of interest rate instruments with binominal trees
+<!-- Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*. -->
+
+<!-- When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file).  -->
+
+<!-- The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed. -->
+
